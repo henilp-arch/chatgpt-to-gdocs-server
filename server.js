@@ -117,7 +117,9 @@ app.get("/", (req, res) => {
     let history      = [];
 
     function connect() {
-      const ws = new WebSocket("ws://" + location.host);
+      // FIX: Use wss:// on HTTPS (Railway), ws:// on HTTP (localhost)
+      const proto = location.protocol === "https:" ? "wss://" : "ws://";
+      const ws = new WebSocket(proto + location.host);
 
       ws.onopen = () => {
         dot.className = "dot live";
