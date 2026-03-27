@@ -1,7 +1,7 @@
-// server.js — Production v13
-// STRATEGY: Clear doc first, wait for confirmation, THEN stream chunks in real-time.
-// This eliminates the race condition from v11 while keeping near real-time doc writes.
-// Live viewer = instant (WebSocket). Google Doc = ~1-2s delay then real-time.
+// server.js — Production v14
+// STRATEGY: Buffer chunks in memory, flush to Google Docs in batches every 3 seconds.
+// This keeps writes near real-time while staying well under the 60 ops/minute quota.
+// Live viewer = instant via WebSocket. Google Doc = updates every ~3s during streaming.
 
 const express    = require("express");
 const cors       = require("cors");
@@ -17,6 +17,10 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+// How often to flush pending chunks to Google Docs (milliseconds)
+// 3000ms = ~20 ops/min max, well under the 60 ops/min quota
+const FLUSH_INTERVAL_MS = 3000;
 
 // ─── WebSocket clients ────────────────────────────────────────────────────────
 const wsClients = new Set();
@@ -46,9 +50,8 @@ app.get("/", (req, res) => {
     .title { font-size:13px; font-weight:600; color:#fff; }
     .status { margin-left:auto; font-size:11px; color:#444; display:flex; align-items:center; gap:6px; }
     .dot { width:6px; height:6px; border-radius:50%; background:#333; }
-    .dot.live    { background:#10a37f; box-shadow:0 0 6px #10a37f88; animation:pulse 1.5s infinite; }
-    .dot.saving  { background:#f59e0b; box-shadow:0 0 6px #f59e0b88; animation:pulse 1.5s infinite; }
-    .dot.cleared { background:#6366f1; box-shadow:0 0 6px #6366f188; animation:pulse 1.5s infinite; }
+    .dot.live   { background:#10a37f; box-shadow:0 0 6px #10a37f88; animation:pulse 1.5s infinite; }
+    .dot.saving { background:#f59e0b; box-shadow:0 0 6px #f59e0b88; animation:pulse 1.5s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
     .content { max-width:760px; margin:0 auto; padding:80px 24px 60px; }
     .question { background:#161616; border:1px solid #222; border-radius:10px; padding:14px 18px; margin-bottom:20px; font-size:13px; color:#888; display:none; }
@@ -57,8 +60,9 @@ app.get("/", (req, res) => {
     .cursor { display:inline-block; width:2px; height:18px; background:#10a37f; margin-left:2px; vertical-align:middle; animation:blink 1s infinite; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
     .cursor.hidden { display:none; }
-    .saved-badge { position:fixed; bottom:24px; right:24px; background:#161616; border:1px solid #10a37f44; color:#10a37f; font-size:11px; padding:8px 14px; border-radius:8px; display:none; }
-    .error-badge { position:fixed; bottom:24px; right:24px; background:#1a0a0a; border:1px solid #ff575744; color:#ff5757; font-size:11px; padding:8px 14px; border-radius:8px; display:none; }
+    .doc-pill { position:fixed; bottom:24px; right:24px; background:#161616; border:1px solid #333; font-size:11px; padding:8px 14px; border-radius:8px; display:none; transition: border-color 0.3s; }
+    .doc-pill.syncing { border-color:#f59e0b44; color:#f59e0b; }
+    .doc-pill.saved   { border-color:#10a37f44; color:#10a37f; }
     .history { margin-top:40px; border-top:1px solid #1a1a1a; padding-top:40px; }
     .history-item { margin-bottom:32px; opacity:0.6; }
     .history-q { font-size:11px; color:#555; margin-bottom:8px; }
@@ -79,20 +83,27 @@ app.get("/", (req, res) => {
     <div class="response" id="response"><span class="cursor hidden" id="cursor"></span></div>
     <div class="history" id="history" style="display:none"></div>
   </div>
-  <div class="saved-badge" id="savedBadge">&#10003; Saved to Google Docs</div>
-  <div class="error-badge" id="errorBadge"></div>
+  <div class="doc-pill" id="docPill"></div>
   <script>
-    const dot = document.getElementById("dot");
-    const statusText = document.getElementById("statusText");
-    const questionEl = document.getElementById("question");
+    const dot          = document.getElementById("dot");
+    const statusText   = document.getElementById("statusText");
+    const questionEl   = document.getElementById("question");
     const questionText = document.getElementById("questionText");
-    const responseEl = document.getElementById("response");
-    const cursor = document.getElementById("cursor");
-    const historyEl = document.getElementById("history");
-    const savedBadge = document.getElementById("savedBadge");
-    const errorBadge = document.getElementById("errorBadge");
+    const responseEl   = document.getElementById("response");
+    const cursor       = document.getElementById("cursor");
+    const historyEl    = document.getElementById("history");
+    const docPill      = document.getElementById("docPill");
     let currentText = "";
     let history = [];
+    let pillTimer = null;
+
+    function showPill(cls, text, autohide) {
+      clearTimeout(pillTimer);
+      docPill.className = "doc-pill " + cls;
+      docPill.textContent = text;
+      docPill.style.display = "block";
+      if (autohide) pillTimer = setTimeout(() => { docPill.style.display = "none"; }, autohide);
+    }
 
     function connect() {
       const proto = location.protocol === "https:" ? "wss://" : "ws://";
@@ -111,33 +122,29 @@ app.get("/", (req, res) => {
           cursor.className = "cursor";
           statusText.textContent = "Streaming...";
           dot.className = "dot live";
+          docPill.style.display = "none";
         }
         if (msg.type === "chunk") {
           currentText += msg.text;
           responseEl.insertBefore(document.createTextNode(msg.text), cursor);
           window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
         }
-        if (msg.type === "doc_ready") {
-          statusText.textContent = "Writing to doc in real-time...";
-          dot.className = "dot cleared";
+        if (msg.type === "batch_written") {
+          showPill("syncing", "&#8635; Doc syncing... (" + msg.chars + " chars)");
         }
         if (msg.type === "done") {
           cursor.className = "cursor hidden";
-          statusText.textContent = "Verifying...";
+          statusText.textContent = "Finalising doc...";
           dot.className = "dot saving";
         }
         if (msg.type === "saved") {
           dot.className = "dot";
           statusText.textContent = "Saved to Google Docs ✓";
-          savedBadge.style.display = "block";
-          setTimeout(() => { savedBadge.style.display = "none"; }, 3000);
+          showPill("saved", "&#10003; Saved to Google Docs", 3000);
         }
         if (msg.type === "error") {
           dot.className = "dot";
-          statusText.textContent = "Error saving to Docs";
-          errorBadge.textContent = msg.message;
-          errorBadge.style.display = "block";
-          setTimeout(() => { errorBadge.style.display = "none"; }, 5000);
+          statusText.textContent = "Error: " + msg.message;
         }
       };
     }
@@ -161,22 +168,22 @@ const docState = {};
 function getState(docId) {
   if (!docState[docId]) {
     docState[docId] = {
-      // Write queue — all doc writes chain onto this promise so they're serial
-      writeQueue:    Promise.resolve(),
-      // true once doc has been cleared and insertIndex is valid
-      docReady:      false,
-      // chunks that arrived before docReady — flushed atomically when gate opens
-      preBuffer:     "",
-      // insertIndex in the Google Doc — only valid after docReady=true
-      insertIndex:   null,
-      // full text of this response (for verify step)
+      // Full response text built up as chunks arrive
       groundTruth:   "",
+      // Pending text not yet written to doc (cleared after each batch flush)
+      pendingBuffer: "",
+      // Current insert index in the Google Doc
+      insertIndex:   null,
+      // true once doc has been cleared and we know insertIndex
+      docReady:      false,
+      // Interval timer for batch flushing
+      flushTimer:    null,
+      // Serial write queue so batches never overlap
+      writeQueue:    Promise.resolve(),
       _token:        null,
       _sessionId:    0,
       firstChunkAt:  null,
       lastChunkAt:   null,
-      firstWriteAt:  null,
-      lastWriteAt:   null,
     };
   }
   return docState[docId];
@@ -189,7 +196,7 @@ function getDocsClient(accessToken) {
 }
 
 // ─── Retry with exponential backoff ──────────────────────────────────────────
-async function retryWithBackoff(fn, maxAttempts = 6, baseDelayMs = 2000) {
+async function retryWithBackoff(fn, maxAttempts = 5, baseDelayMs = 2000) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
@@ -204,13 +211,13 @@ async function retryWithBackoff(fn, maxAttempts = 6, baseDelayMs = 2000) {
   }
 }
 
-// ─── Append text to doc at current insertIndex (serial, one at a time) ────────
-function enqueueWrite(docId, text, sessionId) {
+// ─── Enqueue one batch write onto the serial queue ───────────────────────────
+function enqueueBatchWrite(docId, text, sessionId) {
   if (!text) return;
   const state = getState(docId);
 
   state.writeQueue = state.writeQueue.then(async () => {
-    if (state._sessionId !== sessionId) return; // stale session
+    if (state._sessionId !== sessionId) return;
     if (!state.docReady || state.insertIndex === null || !state._token) return;
 
     try {
@@ -224,12 +231,24 @@ function enqueueWrite(docId, text, sessionId) {
         })
       );
       state.insertIndex += text.length;
-      if (!state.firstWriteAt) state.firstWriteAt = Date.now();
-      state.lastWriteAt = Date.now();
+      console.log(`[BATCH] Wrote ${text.length} chars — insertIndex now ${state.insertIndex}`);
+      broadcast({ type: "batch_written", chars: state.groundTruth.length });
     } catch (err) {
-      console.error("[WRITE] Error:", err.message);
+      console.error("[BATCH] Write error:", err.message);
+      // Put text back so it gets retried next flush
+      state.pendingBuffer = text + state.pendingBuffer;
     }
   }).catch(err => console.error("[QUEUE] Error:", err.message));
+}
+
+// ─── Flush pending buffer as one batch write ──────────────────────────────────
+function flushPending(docId, sessionId) {
+  const state = getState(docId);
+  if (!state.pendingBuffer || !state.docReady) return;
+
+  const toWrite      = state.pendingBuffer;
+  state.pendingBuffer = "";
+  enqueueBatchWrite(docId, toWrite, sessionId);
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -241,9 +260,9 @@ function requireToken(req, res, next) {
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ ok: true, version: "13.0" }));
+app.get("/health", (req, res) => res.json({ ok: true, version: "14.0" }));
 
-// New question — reset state, then clear doc in background
+// New question — clear doc, set up batch flush timer
 app.post("/new-conversation", requireToken, async (req, res) => {
   const { question, docId } = req.body;
   if (!docId) return res.status(400).json({ error: "No docId." });
@@ -251,29 +270,29 @@ app.post("/new-conversation", requireToken, async (req, res) => {
   process.stdout.write(`\n\n❓ ${question}\n${"─".repeat(40)}\n`);
   broadcast({ type: "new", question });
 
-  const state        = getState(docId);
+  const state       = getState(docId);
+
+  // Stop any existing flush timer
+  if (state.flushTimer) { clearInterval(state.flushTimer); state.flushTimer = null; }
+
   state._sessionId  += 1;
   const sessionId    = state._sessionId;
 
-  // Reset everything for this new response
-  state.docReady     = false;
-  state.preBuffer    = "";
   state.groundTruth  = "";
+  state.pendingBuffer = "";
+  state.docReady     = false;
   state.insertIndex  = null;
   state._token       = req.accessToken;
   state.firstChunkAt = null;
   state.lastChunkAt  = null;
-  state.firstWriteAt = null;
-  state.lastWriteAt  = null;
-  state.writeQueue   = Promise.resolve(); // fresh queue
+  state.writeQueue   = Promise.resolve();
 
-  res.json({ ok: true }); // respond immediately — don't block extension
+  res.json({ ok: true });
 
-  // Clear the doc in background — once done, open the gate
+  // Clear the doc in background, then open the gate + start batch timer
   (async () => {
     try {
       const docsClient = getDocsClient(req.accessToken);
-
       console.log("  [clear] fetching doc...");
       const docRes  = await docsClient.documents.get({ documentId: docId });
       const content = docRes.data.body.content;
@@ -291,24 +310,19 @@ app.post("/new-conversation", requireToken, async (req, res) => {
         );
       }
 
-      if (state._sessionId !== sessionId) {
-        console.log("  [clear] session changed — aborting");
-        return;
-      }
+      if (state._sessionId !== sessionId) return;
 
       state.insertIndex = 1;
-      console.log("  [ready] doc cleared — gate open, insertIndex = 1");
+      state.docReady    = true;
+      console.log("  [ready] doc cleared — starting batch flush every", FLUSH_INTERVAL_MS / 1000, "s");
 
-      // Flush any chunks that arrived while we were clearing
-      if (state.preBuffer) {
-        const buffered  = state.preBuffer;
-        state.preBuffer = "";
-        console.log(`  [prebuffer] flushing ${buffered.length} chars`);
-        enqueueWrite(docId, buffered, sessionId);
-      }
+      // Flush any chunks that arrived during the clear
+      flushPending(docId, sessionId);
 
-      state.docReady = true; // gate open — future chunks write directly
-      broadcast({ type: "doc_ready" }); // tell live viewer doc is streaming
+      // Start the recurring batch flush timer
+      state.flushTimer = setInterval(() => {
+        if (state._sessionId === sessionId) flushPending(docId, sessionId);
+      }, FLUSH_INTERVAL_MS);
 
     } catch (err) {
       console.error("  [clear] ❌ Error:", err.message);
@@ -317,7 +331,7 @@ app.post("/new-conversation", requireToken, async (req, res) => {
   })();
 });
 
-// Chunk arrived — buffer to groundTruth + live viewer, write to doc if ready
+// Chunk arrived — buffer it, stream to live viewer
 app.post("/chunk", requireToken, async (req, res) => {
   const { text, docId } = req.body;
   if (!docId || !text) return res.json({ ok: true });
@@ -325,28 +339,19 @@ app.post("/chunk", requireToken, async (req, res) => {
   const state = getState(docId);
   const now   = Date.now();
   if (!state.firstChunkAt) state.firstChunkAt = now;
-  state.lastChunkAt = now;
-  state._token      = req.accessToken;
+  state.lastChunkAt  = now;
+  state._token       = req.accessToken;
 
-  // Always track full response for verification
-  state.groundTruth += text;
+  state.groundTruth  += text;
+  state.pendingBuffer += text;  // queued for next batch flush
 
-  // Always stream to live viewer (zero latency)
   process.stdout.write(text);
-  broadcast({ type: "chunk", text });
-
-  if (!state.docReady) {
-    // Doc not cleared yet — hold in preBuffer
-    state.preBuffer += text;
-  } else {
-    // Doc is ready — enqueue this chunk for real-time writing
-    enqueueWrite(docId, text, state._sessionId);
-  }
+  broadcast({ type: "chunk", text }); // live viewer instant
 
   res.json({ ok: true });
 });
 
-// Stream finished — wait for all writes, then verify
+// Stream finished — final flush + verify
 app.post("/stream-end", requireToken, async (req, res) => {
   const { docId } = req.body;
   if (!docId) return res.json({ ok: true });
@@ -355,100 +360,99 @@ app.post("/stream-end", requireToken, async (req, res) => {
   const sessionId = state._sessionId;
   state._token    = req.accessToken;
 
+  // Stop the periodic timer
+  if (state.flushTimer) { clearInterval(state.flushTimer); state.flushTimer = null; }
+
   broadcast({ type: "done" });
   process.stdout.write("\n");
 
+  const totalTime = ((state.lastChunkAt - state.firstChunkAt) / 1000).toFixed(2);
+  console.log(`\n[END] ${state.groundTruth.length} chars in ${totalTime}s`);
+
   res.json({ ok: true });
 
-  // Wait for all enqueued writes to finish
-  await state.writeQueue;
+  (async () => {
+    // Final flush — write any remaining pending text
+    flushPending(docId, sessionId);
 
-  if (state._sessionId !== sessionId) return;
+    // Wait for all queued writes to complete
+    await state.writeQueue;
 
-  const totalTime      = ((state.lastChunkAt  - state.firstChunkAt)  / 1000).toFixed(2);
-  const firstToDoc     = state.firstWriteAt
-    ? ((state.firstWriteAt - state.firstChunkAt) / 1000).toFixed(2) + "s"
-    : "n/a (all prebuffered)";
-  const lastToDoc      = state.lastWriteAt
-    ? ((state.lastWriteAt  - state.lastChunkAt)  / 1000).toFixed(2) + "s"
-    : "n/a";
+    if (state._sessionId !== sessionId) return;
 
-  console.log(`\n${"─".repeat(44)}`);
-  console.log(`⏱️   TIMING REPORT`);
-  console.log(`${"─".repeat(44)}`);
-  console.log(`  ChatGPT response time  : ${totalTime}s`);
-  console.log(`  First chunk → doc      : ${firstToDoc}`);
-  console.log(`  Last chunk → doc       : ${lastToDoc}`);
-  console.log(`${"─".repeat(44)}`);
+    state.docReady = false;
 
-  // ── Verify doc matches ground truth ───────────────────────────────────────
-  console.log("\n[VERIFY] Reading doc back...");
-  try {
-    const docsClient = getDocsClient(req.accessToken);
-    const verifyRes  = await docsClient.documents.get({ documentId: docId });
+    // ── Verify doc matches ground truth ──────────────────────────────────────
+    console.log("\n[VERIFY] Reading doc back...");
+    try {
+      const docsClient = getDocsClient(req.accessToken);
+      const verifyRes  = await docsClient.documents.get({ documentId: docId });
 
-    let docText = "";
-    for (const block of verifyRes.data.body.content) {
-      if (block.paragraph) {
-        for (const el of block.paragraph.elements) {
-          if (el.textRun) docText += el.textRun.content;
+      let docText = "";
+      for (const block of verifyRes.data.body.content) {
+        if (block.paragraph) {
+          for (const el of block.paragraph.elements) {
+            if (el.textRun) docText += el.textRun.content;
+          }
         }
       }
-    }
 
-    const written  = docText.trimEnd();
-    const expected = state.groundTruth.trimEnd();
+      const written  = docText.trimEnd();
+      const expected = state.groundTruth.trimEnd();
 
-    if (written === expected) {
-      console.log("[VERIFY] ✅ Perfect match");
+      if (written === expected) {
+        console.log("[VERIFY] ✅ Perfect match");
+        broadcast({ type: "saved" });
+        return;
+      }
+
+      // Mismatch — rewrite cleanly (only reaches here if something went wrong)
+      console.log(`[VERIFY] ⚠️  Mismatch (doc=${written.length}, expected=${expected.length}) — rewriting...`);
+
+      const currentEnd = Math.max(1,
+        verifyRes.data.body.content[verifyRes.data.body.content.length - 1].endIndex - 1
+      );
+      if (currentEnd > 1) {
+        await retryWithBackoff(() =>
+          docsClient.documents.batchUpdate({
+            documentId: docId,
+            requestBody: {
+              requests: [{ deleteContentRange: { range: { startIndex: 1, endIndex: currentEnd } } }],
+            },
+          })
+        );
+      }
+
+      const CHUNK_SIZE = 10_000;
+      let insertAt = 1;
+      for (let i = 0; i < expected.length; i += CHUNK_SIZE) {
+        const slice = expected.slice(i, i + CHUNK_SIZE);
+        await retryWithBackoff(() =>
+          docsClient.documents.batchUpdate({
+            documentId: docId,
+            requestBody: {
+              requests: [{ insertText: { location: { index: insertAt }, text: slice } }],
+            },
+          })
+        );
+        insertAt += slice.length;
+      }
+
+      console.log("[VERIFY] ✅ Rewrite complete");
       broadcast({ type: "saved" });
-      return;
+
+    } catch (err) {
+      console.error("[VERIFY] ❌ Error:", err.message);
+      broadcast({ type: "error", message: "Verify failed: " + err.message });
     }
-
-    // Mismatch — rewrite the whole thing cleanly
-    console.log(`[VERIFY] ⚠️  Mismatch (doc=${written.length} vs expected=${expected.length}) — rewriting...`);
-
-    const currentEnd = Math.max(1, verifyRes.data.body.content[verifyRes.data.body.content.length - 1].endIndex - 1);
-    if (currentEnd > 1) {
-      await retryWithBackoff(() =>
-        docsClient.documents.batchUpdate({
-          documentId: docId,
-          requestBody: {
-            requests: [{ deleteContentRange: { range: { startIndex: 1, endIndex: currentEnd } } }],
-          },
-        })
-      );
-    }
-
-    const CHUNK_SIZE = 10_000;
-    let insertAt = 1;
-    for (let i = 0; i < expected.length; i += CHUNK_SIZE) {
-      const slice = expected.slice(i, i + CHUNK_SIZE);
-      await retryWithBackoff(() =>
-        docsClient.documents.batchUpdate({
-          documentId: docId,
-          requestBody: {
-            requests: [{ insertText: { location: { index: insertAt }, text: slice } }],
-          },
-        })
-      );
-      insertAt += slice.length;
-    }
-
-    console.log("[VERIFY] ✅ Rewrite complete");
-    broadcast({ type: "saved" });
-
-  } catch (err) {
-    console.error("[VERIFY] ❌ Error:", err.message);
-    broadcast({ type: "error", message: "Verify failed: " + err.message });
-  }
+  })();
 });
 
 // ─── START ────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`\n🚀  ChatGPT → Google Docs v13.0`);
+  console.log(`\n🚀  ChatGPT → Google Docs v14.0`);
   console.log(`🟢  Server: http://localhost:${PORT}`);
   console.log(`👁️   Live viewer: http://localhost:${PORT}`);
-  console.log(`\n   Strategy: clear doc first → stream chunks in real-time → verify at end.`);
-  console.log(`   No race conditions. No scrambled words.\n`);
+  console.log(`\n   Batch flush every ${FLUSH_INTERVAL_MS / 1000}s — max ~${Math.ceil(60000 / FLUSH_INTERVAL_MS)} ops/min (quota: 60).`);
+  console.log(`   Live viewer still instant via WebSocket.\n`);
 });
