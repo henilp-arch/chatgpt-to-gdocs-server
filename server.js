@@ -1,7 +1,12 @@
-// server.js — Production v10
+// server.js — Production v11
 // Real-time display via WebSocket (zero latency)
 // Google Docs written in background + verified at end
 // No .env — token from extension via X-Google-Token header
+//
+// v11 FIX: replaced isFlushing flag + concurrent flushBuffer calls with a
+// proper serial write queue (promise chain). This guarantees that only ONE
+// write is ever in-flight at a time, eliminating the race condition that
+// caused scrambled / out-of-order words in the Google Doc.
 
 const express    = require("express");
 const cors       = require("cors");
@@ -17,6 +22,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
 // ─── WebSocket clients ────────────────────────────────────────────────────────
 const wsClients = new Set();
 
@@ -104,20 +110,19 @@ app.get("/", (req, res) => {
   <div class="saved-badge" id="savedBadge">✓ Saved to Google Docs</div>
 
   <script>
-    const dot        = document.getElementById("dot");
-    const statusText = document.getElementById("statusText");
-    const questionEl = document.getElementById("question");
+    const dot          = document.getElementById("dot");
+    const statusText   = document.getElementById("statusText");
+    const questionEl   = document.getElementById("question");
     const questionText = document.getElementById("questionText");
-    const responseEl = document.getElementById("response");
-    const cursor     = document.getElementById("cursor");
-    const historyEl  = document.getElementById("history");
-    const savedBadge = document.getElementById("savedBadge");
+    const responseEl   = document.getElementById("response");
+    const cursor       = document.getElementById("cursor");
+    const historyEl    = document.getElementById("history");
+    const savedBadge   = document.getElementById("savedBadge");
 
-    let currentText  = "";
-    let history      = [];
+    let currentText = "";
+    let history     = [];
 
     function connect() {
-      // Use wss:// on HTTPS (Railway), ws:// on HTTP (localhost)
       const proto = location.protocol === "https:" ? "wss://" : "ws://";
       const ws = new WebSocket(proto + location.host);
 
@@ -196,12 +201,10 @@ function getState(docId) {
     docState[docId] = {
       insertIndex:   null,
       responseStart: null,
-      buffer:        "",
-      preBuffer:     "",     // holds chunks that arrive before setup completes
-      groundTruth:   "",
-      flushTimer:    null,
-      isFlushing:    false,
-      active:        false,  // true = doc cleared, insertIndex valid, safe to write
+      preBuffer:     "",      // accumulates chunks while doc is being cleared
+      groundTruth:   "",      // full text of this response, for verify step
+      writeQueue:    Promise.resolve(),  // ← serial queue: all writes chain onto this
+      active:        false,   // true once doc is cleared and insertIndex is valid
       firstChunkAt:  null,
       lastChunkAt:   null,
       firstWriteAt:  null,
@@ -220,6 +223,28 @@ function getDocsClient(accessToken) {
   return google.docs({ version: "v1", auth });
 }
 
+// ─── Enqueue a write — returns immediately, executes serially ─────────────────
+// This is the core fix. Instead of a boolean isFlushing flag (which doesn't
+// actually serialize because multiple callers can read isFlushing=false before
+// any of them sets it to true), we chain every write onto a single promise.
+// That makes it physically impossible for two writes to overlap.
+function enqueueWrite(docId, getText, sessionId) {
+  const state = getState(docId);
+  state.writeQueue = state.writeQueue.then(async () => {
+    // Bail if a newer conversation has started
+    if (state._sessionId !== sessionId) return;
+    if (!state.active || state.insertIndex === null || !state._token) return;
+
+    const text = getText(); // called at execution time so we always get latest pending text
+    if (!text) return;
+
+    await writeDirect(docId, text, state._token, sessionId);
+  }).catch(err => {
+    // Swallow queue errors so the chain never breaks
+    console.error("[QUEUE] Unexpected error:", err.message);
+  });
+}
+
 async function writeDirect(docId, text, accessToken, sessionId) {
   if (!text) return;
   const state = getState(docId);
@@ -236,19 +261,19 @@ async function writeDirect(docId, text, accessToken, sessionId) {
     if (state._sessionId !== sessionId) return;
     state.insertIndex += text.length;
     if (!state.firstWriteAt) state.firstWriteAt = Date.now();
-    state.lastWriteAt  = Date.now();
+    state.lastWriteAt = Date.now();
   } catch (err) {
     if (state._sessionId !== sessionId) return;
     if (err.code === 429 || (err.message && err.message.toLowerCase().includes("quota"))) {
       const delay = Math.min(2000 * Math.pow(2, (state._retryCount = (state._retryCount || 0) + 1) - 1), 16000);
-      console.warn(`[WRITE] Quota hit — backing off ${delay/1000}s`);
+      console.warn(`[WRITE] Quota hit — backing off ${delay / 1000}s`);
       await new Promise(r => setTimeout(r, delay));
       state._retryCount = 0;
       await writeDirect(docId, text, accessToken, sessionId);
     } else if (err.code === 401) {
       console.error("❌  Token expired");
     } else if (err.code === 400 && err.message && err.message.includes("must be less than the end index")) {
-      console.warn("⚠️  Stale index detected — re-fetching from doc...");
+      console.warn("⚠️  Stale index — re-fetching...");
       try {
         const docsClient2 = getDocsClient(accessToken);
         const docRes2     = await docsClient2.documents.get({ documentId: docId });
@@ -258,45 +283,14 @@ async function writeDirect(docId, text, accessToken, sessionId) {
         await writeDirect(docId, text, accessToken, sessionId);
       } catch (retryErr) {
         console.error("❌  Retry failed:", retryErr.message);
-        if (state._sessionId === sessionId) state.buffer = text + state.buffer;
       }
     } else {
       console.error("❌  Docs write error:", err.message);
-      if (state._sessionId === sessionId) state.buffer = text + state.buffer;
     }
   }
 }
 
-async function flushBuffer(docId, force = false) {
-  const state = getState(docId);
-  if (!state.active || !state.buffer || state.isFlushing || state.insertIndex === null || !state._token) return;
-
-  const sessionId = state._sessionId;
-  let toWrite = state.buffer;
-
-  if (!force) {
-    const lastBoundary = Math.max(
-      toWrite.lastIndexOf(" "),  toWrite.lastIndexOf("\n"),
-      toWrite.lastIndexOf("."),  toWrite.lastIndexOf(","),
-      toWrite.lastIndexOf("!"),  toWrite.lastIndexOf("?"),
-    );
-    if (lastBoundary <= 0) return;
-    if (lastBoundary < toWrite.length - 1) {
-      state.buffer = toWrite.slice(lastBoundary + 1);
-      toWrite      = toWrite.slice(0, lastBoundary + 1);
-    } else {
-      state.buffer = "";
-    }
-  } else {
-    state.buffer = "";
-  }
-
-  state.isFlushing = true;
-  await writeDirect(docId, toWrite, state._token, sessionId);
-  state.isFlushing = false;
-}
-
-// ─── Retry helper with exponential backoff ────────────────────────────────────
+// ─── Retry helper ─────────────────────────────────────────────────────────────
 async function retryWithBackoff(fn, maxAttempts = 5, baseDelayMs = 2000) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -306,7 +300,7 @@ async function retryWithBackoff(fn, maxAttempts = 5, baseDelayMs = 2000) {
         (err.message && err.message.toLowerCase().includes("quota"));
       if (!isQuota || attempt === maxAttempts) throw err;
       const delay = baseDelayMs * Math.pow(2, attempt - 1);
-      console.log(`[RETRY] Quota hit — waiting ${delay/1000}s before attempt ${attempt + 1}/${maxAttempts}...`);
+      console.log(`[RETRY] Quota — waiting ${delay / 1000}s (attempt ${attempt + 1}/${maxAttempts})`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -341,7 +335,7 @@ async function verifyAndFix(docId, accessToken, sessionId) {
       return;
     }
 
-    console.log("[VERIFY] ⚠️  Fixing — rewriting from scratch...");
+    console.log("[VERIFY] ⚠️  Mismatch — rewriting from scratch...");
 
     const currentDocContent = docRes.data.body.content;
     const currentEnd = Math.max(1, currentDocContent[currentDocContent.length - 1].endIndex - 1);
@@ -392,28 +386,23 @@ function requireToken(req, res, next) {
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ ok: true, version: "10.0" }));
+app.get("/health", (req, res) => res.json({ ok: true, version: "11.0" }));
 
 app.post("/new-conversation", requireToken, async (req, res) => {
   const { question, docId } = req.body;
   if (!docId) return res.status(400).json({ error: "No docId." });
 
   process.stdout.write(`\n\n❓ ${question}\n${"─".repeat(40)}\n`);
-
   broadcast({ type: "new", question });
 
   const state = getState(docId);
-  if (state.flushTimer) { clearInterval(state.flushTimer); state.flushTimer = null; }
 
   state._sessionId  += 1;
   const sessionId    = state._sessionId;
 
-  // Reset everything. active=false means /chunk will route to preBuffer.
-  // insertIndex=null forces a clean re-fetch — never reuse a stale index.
-  state.buffer       = "";
+  // Full reset — active=false gates /chunk into preBuffer
   state.preBuffer    = "";
   state.groundTruth  = "";
-  state.isFlushing   = false;
   state.active       = false;
   state.insertIndex  = null;
   state.firstChunkAt = null;
@@ -423,15 +412,18 @@ app.post("/new-conversation", requireToken, async (req, res) => {
   state._retryCount  = 0;
   state._token       = req.accessToken;
 
+  // Reset the write queue — new clean chain for this conversation
+  state.writeQueue   = Promise.resolve();
+
   res.json({ ok: true });
 
+  // Setup: clear doc, then open the gate
   (async () => {
     try {
       const docsClient = getDocsClient(req.accessToken);
-
-      const docRes  = await docsClient.documents.get({ documentId: docId });
-      const content = docRes.data.body.content;
-      const docEnd  = Math.max(1, content[content.length - 1].endIndex - 1);
+      const docRes     = await docsClient.documents.get({ documentId: docId });
+      const content    = docRes.data.body.content;
+      const docEnd     = Math.max(1, content[content.length - 1].endIndex - 1);
 
       if (docEnd > 1) {
         console.log("  [clear] deleting existing content, docEnd:", docEnd);
@@ -447,23 +439,22 @@ app.post("/new-conversation", requireToken, async (req, res) => {
       state.responseStart = 1;
       console.log("  [ready] doc cleared, insertIndex = 1");
 
-      if (state._sessionId !== sessionId) return; // newer question fired, abort
+      if (state._sessionId !== sessionId) return;
 
-      // Merge chunks that arrived while the doc was being cleared into main buffer
+      // Flush everything that arrived while the doc was being cleared
       if (state.preBuffer) {
-        state.buffer    = state.preBuffer + state.buffer;
+        const buffered  = state.preBuffer;
         state.preBuffer = "";
-        console.log(`  [prebuffer] released ${state.buffer.length} chars into write queue`);
+        console.log(`  [prebuffer] writing ${buffered.length} chars that arrived during setup`);
+        // Write the entire preBuffer as ONE atomic write so ordering is guaranteed
+        await writeDirect(docId, buffered, req.accessToken, sessionId);
       }
 
-      state.active = true; // gate opens — flushes can now run safely
-
-      await flushBuffer(docId);
-      state.flushTimer = setInterval(() => flushBuffer(docId), 200);
+      state.active = true; // gate open — future chunks write directly
+      console.log("  [active] streaming to doc");
 
     } catch (err) {
       console.error("❌  Setup error:", err.message);
-      // active stays false — chunks remain in preBuffer safely
     }
   })();
 });
@@ -475,29 +466,25 @@ app.post("/chunk", requireToken, async (req, res) => {
   const state = getState(docId);
   const now   = Date.now();
   if (!state.firstChunkAt) state.firstChunkAt = now;
-  state.lastChunkAt  = now;
-  state._token       = req.accessToken;
+  state.lastChunkAt = now;
+  state._token      = req.accessToken;
 
-  // Route to the correct buffer based on whether the doc is ready.
-  // preBuffer holds chunks safely until insertIndex is valid.
-  if (state.active) {
-    state.buffer += text;
-  } else {
-    state.preBuffer += text;
-  }
-
-  state.groundTruth += text; // always track full response for verify step
+  state.groundTruth += text; // always track full response
 
   process.stdout.write(text);
-
   broadcast({ type: "chunk", text });
 
-  res.json({ ok: true });
-
-  // Only flush if the doc write gate is open
-  if (state.active) {
-    flushBuffer(docId).catch(() => {});
+  if (!state.active) {
+    // Doc not ready yet — hold in preBuffer, written atomically when setup finishes
+    state.preBuffer += text;
+  } else {
+    // Doc ready — enqueue this chunk as its own serial write
+    // We snapshot the text NOW (closure) so concurrent chunks each carry their own slice
+    const chunkText = text;
+    enqueueWrite(docId, () => chunkText, state._sessionId);
   }
+
+  res.json({ ok: true });
 });
 
 app.post("/stream-end", requireToken, async (req, res) => {
@@ -508,18 +495,11 @@ app.post("/stream-end", requireToken, async (req, res) => {
   const sessionId = state._sessionId;
   state._token    = req.accessToken;
 
-  if (state.flushTimer) { clearInterval(state.flushTimer); state.flushTimer = null; }
-
   broadcast({ type: "done" });
 
-  await new Promise(r => setTimeout(r, 400));
-  state.isFlushing = false;
+  // Wait for all enqueued writes to finish before verifying
+  await state.writeQueue;
 
-  let attempts = 0;
-  while (state.buffer && attempts < 10) {
-    await flushBuffer(docId, true);
-    attempts++;
-  }
   state.active = false;
 
   process.stdout.write("\n");
@@ -531,14 +511,14 @@ app.post("/stream-end", requireToken, async (req, res) => {
   console.log("\n" + "─".repeat(44));
   console.log("⏱️   TIMING REPORT");
   console.log("─".repeat(44));
-  console.log(`  First chunk at server  : ${new Date(state.firstChunkAt).toISOString().slice(11,23)}`);
-  console.log(`  First word in doc      : ${new Date(state.firstWriteAt).toISOString().slice(11,23)}`);
-  console.log(`  Last chunk at server   : ${new Date(state.lastChunkAt).toISOString().slice(11,23)}`);
-  console.log(`  Last word in doc       : ${new Date(state.lastWriteAt).toISOString().slice(11,23)}`);
+  console.log(`  First chunk at server  : ${new Date(state.firstChunkAt).toISOString().slice(11, 23)}`);
+  console.log(`  First word in doc      : ${new Date(state.firstWriteAt).toISOString().slice(11, 23)}`);
+  console.log(`  Last chunk at server   : ${new Date(state.lastChunkAt).toISOString().slice(11, 23)}`);
+  console.log(`  Last word in doc       : ${new Date(state.lastWriteAt).toISOString().slice(11, 23)}`);
   console.log("─".repeat(44));
-  console.log(`  ChatGPT response time  : ${(totalResponse/1000).toFixed(2)}s`);
-  console.log(`  First chunk → doc      : ${firstChunkToDoc > 0 ? (firstChunkToDoc/1000).toFixed(2)+"s ← how fast first word appears" : "instant"}`);
-  console.log(`  Last chunk → doc       : ${lastChunkToDoc > 0 ? (lastChunkToDoc/1000).toFixed(2)+"s" : "already written"}`);
+  console.log(`  ChatGPT response time  : ${(totalResponse / 1000).toFixed(2)}s`);
+  console.log(`  First chunk → doc      : ${firstChunkToDoc > 0 ? (firstChunkToDoc / 1000).toFixed(2) + "s ← how fast first word appears" : "instant"}`);
+  console.log(`  Last chunk → doc       : ${lastChunkToDoc > 0 ? (lastChunkToDoc / 1000).toFixed(2) + "s" : "already written"}`);
   console.log("─".repeat(44));
 
   setTimeout(() => verifyAndFix(docId, req.accessToken, sessionId), 1000);
@@ -548,9 +528,8 @@ app.post("/stream-end", requireToken, async (req, res) => {
 
 // ─── START ────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`\n🚀  ChatGPT → Google Docs v10.0`);
+  console.log(`\n🚀  ChatGPT → Google Docs v11.0`);
   console.log(`🟢  Server: http://localhost:${PORT}`);
   console.log(`👁️   Live viewer: http://localhost:${PORT}`);
-  console.log(`\n   Open the live viewer in your browser for real-time display.`);
-  console.log(`   Google Docs gets written + verified in background.\n`);
+  console.log(`\n   Chunks are now written serially — no more scrambled words.\n`);
 });
