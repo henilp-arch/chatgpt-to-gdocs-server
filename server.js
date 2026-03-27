@@ -1,4 +1,4 @@
-// server.js — Production v9
+// server.js — Production v10
 // Real-time display via WebSocket (zero latency)
 // Google Docs written in background + verified at end
 // No .env — token from extension via X-Google-Token header
@@ -117,7 +117,7 @@ app.get("/", (req, res) => {
     let history      = [];
 
     function connect() {
-      // FIX: Use wss:// on HTTPS (Railway), ws:// on HTTP (localhost)
+      // Use wss:// on HTTPS (Railway), ws:// on HTTP (localhost)
       const proto = location.protocol === "https:" ? "wss://" : "ws://";
       const ws = new WebSocket(proto + location.host);
 
@@ -136,7 +136,6 @@ app.get("/", (req, res) => {
         const msg = JSON.parse(e.data);
 
         if (msg.type === "new") {
-          // Save previous to history
           if (currentText) {
             history.unshift({ q: questionText.textContent, a: currentText });
             renderHistory();
@@ -153,10 +152,8 @@ app.get("/", (req, res) => {
 
         if (msg.type === "chunk") {
           currentText += msg.text;
-          // Insert text before cursor
           const textNode = document.createTextNode(msg.text);
           responseEl.insertBefore(textNode, cursor);
-          // Auto scroll
           window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
         }
 
@@ -204,13 +201,14 @@ function getState(docId) {
       groundTruth:   "",
       flushTimer:    null,
       isFlushing:    false,
-      active:        false,   // true = header written, safe to flush
+      active:        false,  // true = doc cleared, insertIndex valid, safe to write
       firstChunkAt:  null,
       lastChunkAt:   null,
       firstWriteAt:  null,
       lastWriteAt:   null,
       _token:        null,
       _sessionId:    0,
+      _retryCount:   0,
     };
   }
   return docState[docId];
@@ -242,7 +240,6 @@ async function writeDirect(docId, text, accessToken, sessionId) {
   } catch (err) {
     if (state._sessionId !== sessionId) return;
     if (err.code === 429 || (err.message && err.message.toLowerCase().includes("quota"))) {
-      // Exponential backoff: don't hammer the quota further
       const delay = Math.min(2000 * Math.pow(2, (state._retryCount = (state._retryCount || 0) + 1) - 1), 16000);
       console.warn(`[WRITE] Quota hit — backing off ${delay/1000}s`);
       await new Promise(r => setTimeout(r, delay));
@@ -251,8 +248,6 @@ async function writeDirect(docId, text, accessToken, sessionId) {
     } else if (err.code === 401) {
       console.error("❌  Token expired");
     } else if (err.code === 400 && err.message && err.message.includes("must be less than the end index")) {
-      // Cached index is stale — doc was modified externally
-      // Re-fetch the real index and retry once
       console.warn("⚠️  Stale index detected — re-fetching from doc...");
       try {
         const docsClient2 = getDocsClient(accessToken);
@@ -260,7 +255,6 @@ async function writeDirect(docId, text, accessToken, sessionId) {
         const content2    = docRes2.data.body.content;
         state.insertIndex = Math.max(1, content2[content2.length - 1].endIndex - 1);
         console.log("  [index] refreshed to:", state.insertIndex);
-        // Retry the write with the correct index
         await writeDirect(docId, text, accessToken, sessionId);
       } catch (retryErr) {
         console.error("❌  Retry failed:", retryErr.message);
@@ -275,20 +269,18 @@ async function writeDirect(docId, text, accessToken, sessionId) {
 
 async function flushBuffer(docId, force = false) {
   const state = getState(docId);
-  // active=false means header not written yet — insertIndex not safe to use
   if (!state.active || !state.buffer || state.isFlushing || state.insertIndex === null || !state._token) return;
 
   const sessionId = state._sessionId;
   let toWrite = state.buffer;
 
   if (!force) {
-    // Wait for at least a word boundary so we never split a word
     const lastBoundary = Math.max(
       toWrite.lastIndexOf(" "),  toWrite.lastIndexOf("\n"),
       toWrite.lastIndexOf("."),  toWrite.lastIndexOf(","),
       toWrite.lastIndexOf("!"),  toWrite.lastIndexOf("?"),
     );
-    if (lastBoundary <= 0) return; // no complete word yet
+    if (lastBoundary <= 0) return;
     if (lastBoundary < toWrite.length - 1) {
       state.buffer = toWrite.slice(lastBoundary + 1);
       toWrite      = toWrite.slice(0, lastBoundary + 1);
@@ -313,7 +305,7 @@ async function retryWithBackoff(fn, maxAttempts = 5, baseDelayMs = 2000) {
       const isQuota = err.code === 429 ||
         (err.message && err.message.toLowerCase().includes("quota"));
       if (!isQuota || attempt === maxAttempts) throw err;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1); // 2s, 4s, 8s, 16s...
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
       console.log(`[RETRY] Quota hit — waiting ${delay/1000}s before attempt ${attempt + 1}/${maxAttempts}...`);
       await new Promise(r => setTimeout(r, delay));
     }
@@ -354,7 +346,6 @@ async function verifyAndFix(docId, accessToken, sessionId) {
     const currentDocContent = docRes.data.body.content;
     const currentEnd = Math.max(1, currentDocContent[currentDocContent.length - 1].endIndex - 1);
 
-    // Step 1: delete existing content (with quota retry)
     if (currentEnd > 1) {
       await retryWithBackoff(() =>
         docsClient.documents.batchUpdate({
@@ -366,8 +357,6 @@ async function verifyAndFix(docId, accessToken, sessionId) {
       );
     }
 
-    // Step 2: insert corrected content (with quota retry)
-    // Split into ≤10 000-char chunks to stay well under the per-request limit
     const CHUNK_SIZE = 10_000;
     const text = state.groundTruth;
     let insertAt = 1;
@@ -390,7 +379,6 @@ async function verifyAndFix(docId, accessToken, sessionId) {
 
   } catch (err) {
     console.error("[VERIFY] ❌ Error:", err.message);
-    // Still mark as verified in the UI so user knows the response is complete
     broadcast({ type: "verified" });
   }
 }
@@ -404,7 +392,7 @@ function requireToken(req, res, next) {
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ ok: true, version: "9.0" }));
+app.get("/health", (req, res) => res.json({ ok: true, version: "10.0" }));
 
 app.post("/new-conversation", requireToken, async (req, res) => {
   const { question, docId } = req.body;
@@ -412,7 +400,6 @@ app.post("/new-conversation", requireToken, async (req, res) => {
 
   process.stdout.write(`\n\n❓ ${question}\n${"─".repeat(40)}\n`);
 
-  // Broadcast to live viewer instantly
   broadcast({ type: "new", question });
 
   const state = getState(docId);
@@ -420,32 +407,32 @@ app.post("/new-conversation", requireToken, async (req, res) => {
 
   state._sessionId  += 1;
   const sessionId    = state._sessionId;
+
+  // Reset everything. active=false means /chunk will route to preBuffer.
+  // insertIndex=null forces a clean re-fetch — never reuse a stale index.
   state.buffer       = "";
   state.preBuffer    = "";
   state.groundTruth  = "";
   state.isFlushing   = false;
   state.active       = false;
+  state.insertIndex  = null;
   state.firstChunkAt = null;
   state.lastChunkAt  = null;
   state.firstWriteAt = null;
+  state.lastWriteAt  = null;
+  state._retryCount  = 0;
   state._token       = req.accessToken;
-  // NOTE: insertIndex is intentionally NOT reset here
-  // We keep the cached value from the last response to skip doc.get()
 
-  // Respond immediately — don't block the extension at all
   res.json({ ok: true });
 
-  // Setup runs in background
   (async () => {
     try {
       const docsClient = getDocsClient(req.accessToken);
 
-      // ── Always fetch the doc to get current content length ──
       const docRes  = await docsClient.documents.get({ documentId: docId });
       const content = docRes.data.body.content;
       const docEnd  = Math.max(1, content[content.length - 1].endIndex - 1);
 
-      // ── Delete ALL existing content in the doc (start fresh for each response) ──
       if (docEnd > 1) {
         console.log("  [clear] deleting existing content, docEnd:", docEnd);
         await docsClient.documents.batchUpdate({
@@ -456,26 +443,27 @@ app.post("/new-conversation", requireToken, async (req, res) => {
         });
       }
 
-      // After clearing, doc is empty — insert index starts at 1
       state.insertIndex   = 1;
       state.responseStart = 1;
-      console.log("  [index] doc cleared, starting at 1");
+      console.log("  [ready] doc cleared, insertIndex = 1");
 
-      if (state._sessionId === sessionId) {
-        // Move preBuffer into main buffer — now insertIndex is valid
-        if (state.preBuffer) {
-          state.buffer    += state.preBuffer;
-          state.preBuffer  = "";
-          console.log("  [prebuffer] released", state.buffer.length, "chars");
-        }
-        state.active = true; // NOW safe — index is correct, preBuffer released
-        // Flush everything that accumulated during setup
-        await flushBuffer(docId);
-        state.flushTimer = setInterval(() => flushBuffer(docId), 200);
+      if (state._sessionId !== sessionId) return; // newer question fired, abort
+
+      // Merge chunks that arrived while the doc was being cleared into main buffer
+      if (state.preBuffer) {
+        state.buffer    = state.preBuffer + state.buffer;
+        state.preBuffer = "";
+        console.log(`  [prebuffer] released ${state.buffer.length} chars into write queue`);
       }
+
+      state.active = true; // gate opens — flushes can now run safely
+
+      await flushBuffer(docId);
+      state.flushTimer = setInterval(() => flushBuffer(docId), 200);
+
     } catch (err) {
       console.error("❌  Setup error:", err.message);
-      getState(docId).insertIndex = null;
+      // active stays false — chunks remain in preBuffer safely
     }
   })();
 });
@@ -489,18 +477,27 @@ app.post("/chunk", requireToken, async (req, res) => {
   if (!state.firstChunkAt) state.firstChunkAt = now;
   state.lastChunkAt  = now;
   state._token       = req.accessToken;
-  state.buffer      += text;
-  state.groundTruth += text;
+
+  // Route to the correct buffer based on whether the doc is ready.
+  // preBuffer holds chunks safely until insertIndex is valid.
+  if (state.active) {
+    state.buffer += text;
+  } else {
+    state.preBuffer += text;
+  }
+
+  state.groundTruth += text; // always track full response for verify step
 
   process.stdout.write(text);
 
-  // Broadcast to live viewer — zero latency, truly real-time
   broadcast({ type: "chunk", text });
 
   res.json({ ok: true });
 
-  // Trigger flush immediately on every chunk — no waiting for timer
-  flushBuffer(docId).catch(() => {});
+  // Only flush if the doc write gate is open
+  if (state.active) {
+    flushBuffer(docId).catch(() => {});
+  }
 });
 
 app.post("/stream-end", requireToken, async (req, res) => {
@@ -518,7 +515,6 @@ app.post("/stream-end", requireToken, async (req, res) => {
   await new Promise(r => setTimeout(r, 400));
   state.isFlushing = false;
 
-  // Drain buffer completely — keep flushing until nothing left
   let attempts = 0;
   while (state.buffer && attempts < 10) {
     await flushBuffer(docId, true);
@@ -528,9 +524,9 @@ app.post("/stream-end", requireToken, async (req, res) => {
 
   process.stdout.write("\n");
 
-  const totalResponse    = state.lastChunkAt  - state.firstChunkAt;
-  const firstChunkToDoc  = state.firstWriteAt - state.firstChunkAt;
-  const lastChunkToDoc   = state.lastWriteAt  - state.lastChunkAt;
+  const totalResponse   = state.lastChunkAt  - state.firstChunkAt;
+  const firstChunkToDoc = state.firstWriteAt - state.firstChunkAt;
+  const lastChunkToDoc  = state.lastWriteAt  - state.lastChunkAt;
 
   console.log("\n" + "─".repeat(44));
   console.log("⏱️   TIMING REPORT");
@@ -552,7 +548,7 @@ app.post("/stream-end", requireToken, async (req, res) => {
 
 // ─── START ────────────────────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`\n🚀  ChatGPT → Google Docs v9.0`);
+  console.log(`\n🚀  ChatGPT → Google Docs v10.0`);
   console.log(`🟢  Server: http://localhost:${PORT}`);
   console.log(`👁️   Live viewer: http://localhost:${PORT}`);
   console.log(`\n   Open the live viewer in your browser for real-time display.`);
